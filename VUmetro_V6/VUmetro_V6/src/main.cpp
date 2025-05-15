@@ -27,9 +27,10 @@
 #define I2S_PORT I2S_NUM_0
 #define bufferLen 64
 
-#define NUM_LEDS 1
-#define PIN_LED 48
-#define umbral 100
+#define NUM_LEDS 200
+#define PIN_LED 9
+#define umbral 45
+#define NUM_ESTRELLAS 50
 
 #define APP_KEY ""
 #define APP_SECRET ""
@@ -47,10 +48,6 @@ TiraLEDdebajosofa &tiraLEDdebajosofa = SinricPro[DEVICE_ID];
  ***********************************************
  * Global variables to store the device states *
  ***********************************************/
-
-// ModeController
-std::map<String, String> globalModes;
-
 // ColorController
 struct Color
 {
@@ -59,11 +56,35 @@ struct Color
   byte b;
 };
 
-Color color;
+Color color = {255, 255, 255};
+
+QueueHandle_t xQueueComandos; // Cola de comandos LED
+enum LedMode
+{
+  LED_MODE_OFF,
+  LED_MODE_BLINK,
+  LED_MODE_STATIC,
+  LED_MODE_RANDOM,
+  LED_MODE_RAINBOW,
+  LED_MODE_LIGHTNING,
+  LED_MODE_MICROPHONE
+};
+
+struct LedCommand
+{
+  LedMode mode;
+  Color color;
+  int brightness;
+};
+
+LedMode modoActual = LED_MODE_MICROPHONE;
+
+// ModeController
+std::map<String, String> globalModes;
 
 // BrightnessController
-int globalBrightness;
-int brillo = 0;
+int globalBrightness = 255;
+bool trigger = false;
 Adafruit_NeoPixel pixels(NUM_LEDS, PIN_LED, NEO_RGB);
 int16_t sBuffer[bufferLen];
 
@@ -74,6 +95,12 @@ void i2s_install();
 void i2s_setpin();
 void TaskTiraLed(void *Pvparameters);
 void TaskMicrofono(void *Pvparameters);
+void TaskSinricPro(void *Pvparameters);
+void sendLedCommand(LedMode mode, Color color, int brightness)
+{
+  LedCommand cmd = {mode, color, brightness};
+  xQueueSend(xQueueComandos, &cmd, portMAX_DELAY);
+}
 
 /*************
  * Callbacks *
@@ -82,8 +109,44 @@ void TaskMicrofono(void *Pvparameters);
 // ModeController
 bool onSetMode(const String &deviceId, const String &instance, String &mode)
 {
-  Serial.printf("[Device: %s]: Modesetting for \"%s\" set to mode %s\r\n", deviceId.c_str(), instance.c_str(), mode.c_str());
+  Serial.printf("[Device: %s]: Mode \"%s\" set to %s\r\n", deviceId.c_str(), instance.c_str(), mode.c_str());
+
   globalModes[instance] = mode;
+
+  if (mode == "LIGHTNING")
+  {
+    modoActual = LED_MODE_LIGHTNING;
+  }
+  else if (mode == "BLINK")
+  {
+    modoActual = LED_MODE_BLINK;
+  }
+  else if (mode == "STATIC")
+  {
+    modoActual = LED_MODE_STATIC;
+  }
+  else if (mode == "RANDOM")
+  {
+    modoActual = LED_MODE_RANDOM;
+  }
+  else if (mode == "RAINBOW")
+  {
+    modoActual = LED_MODE_RAINBOW;
+  }
+  else if (mode == "MICROPHONE")
+  {
+    modoActual = LED_MODE_MICROPHONE;
+  }
+  else if (mode == "OFF")
+  {
+    modoActual = LED_MODE_OFF;
+  }
+  else
+  {
+    modoActual = LED_MODE_STATIC;
+  }
+
+  sendLedCommand(modoActual, color, globalBrightness);
   return true;
 }
 
@@ -91,10 +154,10 @@ bool onSetMode(const String &deviceId, const String &instance, String &mode)
 bool onColor(const String &deviceId, byte &r, byte &g, byte &b)
 {
   Serial.printf("[Device: %s]: Color set to red=%d, green=%d, blue=%d\r\n", deviceId.c_str(), r, g, b);
-  color.r = r;
-  color.g = g;
-  color.b = b;
-  return true; // request handled properly
+  color = {r, g, b}; // Guardamos color global
+
+  sendLedCommand(modoActual, color, globalBrightness);
+  return true;
 }
 
 // BrightnessController
@@ -102,7 +165,9 @@ bool onBrightness(const String &deviceId, int &brightness)
 {
   Serial.printf("[Device: %s]: Brightness set to %d\r\n", deviceId.c_str(), brightness);
   globalBrightness = brightness;
-  return true; // request handled properly
+
+  sendLedCommand(modoActual, color, brightness);
+  return true;
 }
 
 bool onAdjustBrightness(const String &deviceId, int &brightnessDelta)
@@ -187,6 +252,15 @@ void setup()
   Serial.begin(BAUD_RATE);
   setupWiFi();
   setupSinricPro();
+  xQueueComandos = xQueueCreate(5, sizeof(LedCommand));
+  xTaskCreate(
+      TaskSinricPro,
+      "TaskMicrofono",
+      10000,
+      NULL,
+      0,
+      NULL);
+
   xTaskCreate(
       TaskMicrofono,
       "TaskMicrofono",
@@ -210,9 +284,17 @@ void setup()
 
 void loop()
 {
-  SinricPro.handle();
+  vTaskDelay(50 / portTICK_PERIOD_MS);
 }
 
+void TaskSinricPro(void *Pvparameters)
+{
+  for (;;)
+  {
+    SinricPro.handle();
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
 void TaskMicrofono(void *Pvparameters)
 {
   Serial.println("Setup I2S ...");
@@ -237,21 +319,28 @@ void TaskMicrofono(void *Pvparameters)
           mean += (sBuffer[i]);
         }
         mean /= samples_read;
-        // Serial.println(">Media: " + String(mean));
-        // Serial.println(">Umbral: " + String(umbral));
-        // Serial.println(">-Umbral: " + String(-umbral));
         if (abs(mean) > umbral)
         {
-          // Serial.println(">pulso: " + String(1));
-          brillo = 255;
+          trigger = true;
+          // Mandar un trigger para hacer un fade in de los LEDs en la tarea TaskTiraLEDs
         }
         else
         {
         }
-        // Serial.println(">pulso: " + String(0));
+        // float rms = 0;
+        // for (int i = 0; i < samples_read; ++i)
+        // {
+        //   rms += sBuffer[i] * sBuffer[i];
+        // }
+        // rms = sqrt(rms / samples_read);
+
+        // if (rms > umbral)
+        // {
+        //   trigger = true;
+        //   // sendLedCommand(LED_MODE_MICROPHONE, color, globalBrightness);
+        // }
       }
     }
-    // Serial.println(">Brillo: " + String(brillo));
     vTaskDelay(10);
   }
 }
@@ -286,23 +375,321 @@ void i2s_setpin()
 void TaskTiraLed(void *Pvparameters)
 {
   pixels.begin();
-  pixels.setBrightness(50);
   pixels.clear();
   pixels.show();
 
+  LedCommand currentCommand = {LED_MODE_OFF, {0, 0, 0}, 0};
+
+  bool LEDsEncendidos[NUM_ESTRELLAS] = {false};
+  int pixelLEDsEstrellas[NUM_ESTRELLAS] = {-1};
+  int contadorBrillo[NUM_ESTRELLAS] = {0};
+  bool apagadoProgresivo[NUM_ESTRELLAS] = {false};
+  unsigned long tiempoAnteriorEncendido[NUM_ESTRELLAS] = {0};
+  int tiempoDelayEstrellas[NUM_ESTRELLAS] = {0};
+
   for (;;)
   {
-    if (brillo > 0) // Solo ejecuta si hay brillo
+    LedCommand newCommand;
+    if (xQueueReceive(xQueueComandos, &newCommand, 10 / portTICK_PERIOD_MS))
     {
-      // Serial.println("Color: " + (String)color.r + ":" + (String)color.g + "" + (String)color.b);
-      pixels.setPixelColor(0, pixels.Color(color.g*brillo/255, color.r*brillo/255, color.b*brillo/255));
-      pixels.show();
-      brillo--;
+      currentCommand = newCommand;
     }
-    else
+
+    switch (currentCommand.mode)
     {
+    case LED_MODE_OFF:
+      pixels.clear();
       pixels.show();
+      break;
+
+    case LED_MODE_BLINK:
+    {
+      static bool fadingIn = true;
+      static int fadeValue = 0;
+      static unsigned long lastChangeTime = 0;
+      static enum { FADING,
+                    PAUSED } state = FADING;
+      int fadeStep = max(1, currentCommand.brightness / 20);
+
+      const int pauseTime = 500; // ms
+
+      unsigned long now = millis();
+
+      if (state == FADING)
+      {
+        if (fadingIn)
+        {
+          fadeValue += fadeStep;
+          if (fadeValue >= currentCommand.brightness)
+          {
+            fadeValue = currentCommand.brightness;
+            fadingIn = false;
+            state = PAUSED;
+            lastChangeTime = now;
+          }
+        }
+        else
+        {
+          fadeValue -= fadeStep;
+          if (fadeValue <= 0)
+          {
+            fadeValue = 0;
+            fadingIn = true;
+            state = PAUSED;
+            lastChangeTime = now;
+          }
+        }
+
+        // Aplicar fade
+        for (int i = 0; i < NUM_LEDS; ++i)
+        {
+          pixels.setPixelColor(i, pixels.Color(
+                                      currentCommand.color.g * fadeValue / 255,
+                                      currentCommand.color.r * fadeValue / 255,
+                                      currentCommand.color.b * fadeValue / 255));
+        }
+        pixels.show();
+      }
+      else if (state == PAUSED)
+      {
+        if (now - lastChangeTime >= pauseTime)
+        {
+          state = FADING;
+        }
+      }
+
+      vTaskDelay(30 / portTICK_PERIOD_MS);
+      continue;
     }
-    vTaskDelay(5);
+
+    case LED_MODE_STATIC:
+      for (int i = 0; i < NUM_LEDS; ++i)
+      {
+        pixels.setPixelColor(i, pixels.Color(
+                                    currentCommand.color.g * currentCommand.brightness / 255,
+                                    currentCommand.color.r * currentCommand.brightness / 255,
+                                    currentCommand.color.b * currentCommand.brightness / 255));
+      }
+      pixels.show();
+      break;
+
+    case LED_MODE_RANDOM:
+    {
+      uint8_t r = currentCommand.color.r;
+      uint8_t g = currentCommand.color.g;
+      uint8_t b = currentCommand.color.b;
+      int fadeStep = max(1, currentCommand.brightness / 20);
+
+      for (int i = 0; i < NUM_ESTRELLAS; ++i)
+      {
+        if (!LEDsEncendidos[i])
+        {
+          if (random(100) > 96) // 4% de probabilidad por ciclo
+          {
+            int pixel = random(0, NUM_LEDS); // Asignamos un pixel al azar
+            bool repetido = false;
+            for (int j = 0; j < NUM_ESTRELLAS; ++j)
+            {
+              if (pixelLEDsEstrellas[j] == pixel)
+              {
+                repetido = true;
+                break;
+              }
+            }
+
+            if (!repetido)
+            {
+              LEDsEncendidos[i] = true;
+              pixelLEDsEstrellas[i] = pixel;
+              tiempoDelayEstrellas[i] = random(10, 50);
+              apagadoProgresivo[i] = false;
+              contadorBrillo[i] = 0;
+              tiempoAnteriorEncendido[i] = millis();
+            }
+          }
+        }
+        else
+        {
+          unsigned long ahora = millis();
+          int pixel = pixelLEDsEstrellas[i]; // Declaramos pixel aquí para asegurarnos de que esté disponible
+
+          if (ahora - tiempoAnteriorEncendido[i] >= tiempoDelayEstrellas[i])
+          {
+            tiempoAnteriorEncendido[i] = ahora;
+
+            if (!apagadoProgresivo[i])
+            {
+              contadorBrillo[i] += fadeStep;
+              if (contadorBrillo[i] >= currentCommand.brightness)
+              {
+                contadorBrillo[i] = currentCommand.brightness;
+                apagadoProgresivo[i] = true;
+              }
+            }
+            else
+            {
+              contadorBrillo[i] -= fadeStep;
+              if (contadorBrillo[i] <= 0)
+              {
+                contadorBrillo[i] = 0;
+                LEDsEncendidos[i] = false;
+                pixelLEDsEstrellas[i] = -1;
+                apagadoProgresivo[i] = false;
+                tiempoDelayEstrellas[i] = 0;
+
+                pixels.setPixelColor(pixel, 0); // Esto lo apaga completamente
+                continue;                       // Salimos para la siguiente iteración
+              }
+            }
+
+            // Aplicar brillo actual
+            pixels.setPixelColor(pixel, pixels.Color(
+                                            g * contadorBrillo[i] / 255,
+                                            r * contadorBrillo[i] / 255,
+                                            b * contadorBrillo[i] / 255));
+          }
+        }
+      }
+
+      pixels.show();
+      break;
+    }
+
+    case LED_MODE_RAINBOW:
+    {
+      static uint16_t hue = 0;
+      for (int i = 0; i < NUM_LEDS; ++i)
+      {
+        uint32_t color = pixels.gamma32(pixels.ColorHSV(hue + (i * 65536L / NUM_LEDS)));
+        color = pixels.Color(
+            ((color >> 16) & 0xFF) * currentCommand.brightness / 255,
+            ((color >> 8) & 0xFF) * currentCommand.brightness / 255,
+            (color & 0xFF) * currentCommand.brightness / 255);
+        pixels.setPixelColor(i, color);
+      }
+      pixels.show();
+      hue += 256;
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    case LED_MODE_LIGHTNING:
+    {
+      static int rayoPos = 0;
+      static int direccion = 1; // 1 = derecha, -1 = izquierda
+      static unsigned long lastChangeTime = 0;
+      const unsigned long rayoDelay = 1;
+      const int LIGHTNING_LENGTH = 5; // Número de LEDs que forman el rayo
+
+      unsigned long now = millis();
+      if (now - lastChangeTime >= rayoDelay)
+      {
+        // Apaga toda la tira
+        for (int i = 0; i < NUM_LEDS; ++i)
+        {
+          pixels.setPixelColor(i, 0);
+        }
+
+        // Enciende el "rayo" de varios LEDs
+        for (int j = 0; j < LIGHTNING_LENGTH; ++j)
+        {
+          int pos = rayoPos - j * direccion;
+          if (pos >= 0 && pos < NUM_LEDS)
+          {
+            pixels.setPixelColor(pos, pixels.Color(
+                                          currentCommand.color.g * currentCommand.brightness / 255,
+                                          currentCommand.color.r * currentCommand.brightness / 255,
+                                          currentCommand.color.b * currentCommand.brightness / 255));
+          }
+        }
+
+        pixels.show();
+
+        rayoPos += direccion * 2;
+
+        // Cambiar dirección si llega al final o principio
+        if (rayoPos >= NUM_LEDS + LIGHTNING_LENGTH)
+        {
+          direccion = -1;
+          rayoPos = NUM_LEDS + LIGHTNING_LENGTH - 1;
+        }
+        else if (rayoPos < -LIGHTNING_LENGTH)
+        {
+          direccion = 1;
+          rayoPos = -LIGHTNING_LENGTH + 1;
+        }
+
+        lastChangeTime = now;
+      }
+      continue;
+    }
+
+    case LED_MODE_MICROPHONE:
+    {
+      static int brilloActual = 20; // empieza en brillo base
+      static bool enFadeIn = false;
+      static bool enFadeOut = false;
+      static unsigned long ultimaActualizacion = 0;
+    
+      const int fadeStep = 15;          // cuán rápido sube/baja
+      const int delayFade = 10;         // ms entre pasos
+      const int brilloBase = 10;        // brillo cuando está "en reposo"
+      const int brilloMaximo = currentCommand.brightness;
+    
+      unsigned long ahora = millis();
+    
+      if (trigger)
+      {
+        enFadeIn = true;
+        enFadeOut = false;
+        trigger = false;
+      }
+    
+      if (ahora - ultimaActualizacion >= delayFade)
+      {
+        ultimaActualizacion = ahora;
+    
+        if (enFadeIn)
+        {
+          brilloActual += fadeStep;
+          if (brilloActual >= brilloMaximo)
+          {
+            brilloActual = brilloMaximo;
+            enFadeIn = false;
+            enFadeOut = true;
+          }
+        }
+        else if (enFadeOut)
+        {
+          brilloActual -= fadeStep;
+          if (brilloActual <= brilloBase)
+          {
+            brilloActual = brilloBase;
+            enFadeOut = false;
+          }
+        }
+    
+        for (int i = 0; i < NUM_LEDS; ++i)
+        {
+          pixels.setPixelColor(i, pixels.Color(
+                                      currentCommand.color.g * brilloActual / 255,
+                                      currentCommand.color.r * brilloActual / 255,
+                                      currentCommand.color.b * brilloActual / 255));
+        }
+        pixels.show();
+      }
+    
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
+    }
+    
+
+    default:
+      pixels.clear();
+      pixels.show();
+      break;
+    }
+
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
